@@ -1,7 +1,10 @@
+from typing import Dict
+
+import torch
 from datasets import load_dataset
+from loguru import logger
 from torch.utils.data import Dataset
 from transformers import MarianTokenizer
-from loguru import logger
 
 
 class Multi30kDataset(Dataset):
@@ -61,7 +64,7 @@ class Multi30kDataset(Dataset):
     def __len__(self):
         return len(self.processed_data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         item = self.processed_data[idx]
 
         return {
@@ -83,6 +86,9 @@ if __name__ == "__main__":
     train_loader = DataLoader(
         train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
     )
+
+    vocab_size = train_dataset.tokenizer.vocab_size
+    print(f"vocab_size: {vocab_size}")
 
     batch = next(iter(train_loader))
     print(f"Batch keys: {batch.keys()}")
