@@ -1,5 +1,6 @@
 import argparse
 import random
+import math
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from transformer.data.dataset import Multi30kDataset
 from transformer.engines.train import train_one_epoch, valid_one_epoch
-from transformer.model.misc import NoamScheduler
 from transformer.model.transformer import Transformer
+from transformers import get_cosine_schedule_with_warmup
 
 
 def set_seed(seed=42):
@@ -52,15 +53,31 @@ def main():
     parser.add_argument(
         "--mid_dim", type=int, default=2048, help="The hidden dims in FeedForwordNet"
     )
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.98)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_steps", type=int, default=4000)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=2000)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
 
     args = parser.parse_args()
+
+    logger.add(
+        f"{args.log_dir}/train_{{time:YYYY-MM-DD}}.log",
+        rotation="00:00",
+        retention="7 days",
+        encoding="utf-8",
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+    )
 
     set_seed(args.seed)
 
@@ -72,7 +89,10 @@ def main():
         "validation", model_name=args.model_name, max_len=args.max_len
     )
 
-    vocab_size = train_dataset.tokenizer.vocab_size
+    # Use len(tokenizer) to ensure all special tokens are covered
+    vocab_size = len(train_dataset.tokenizer)
+    logger.info(f"Vocab size: {vocab_size}")
+
     padding_index = train_dataset.tokenizer.pad_token_id
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -101,18 +121,24 @@ def main():
         num_encoder_blocks=args.num_encoder_blocks,
         num_decoder_blocks=args.num_decoder_blocks,
         dropout=args.dropout,
+        padding_idx=padding_index,
     ).to(device)
 
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=padding_index, label_smoothing=args.label_smoothing
     )
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         params=model.parameters(),
         lr=args.lr,
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
     )
-    scheduler = NoamScheduler(optimizer, args.embed_dim, args.warmup_steps)
+
+    # scheduler = NoamScheduler(optimizer, args.embed_dim, args.warmup_steps)
+    total_steps = len(train_dataloader) * args.epochs
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps
+    )
 
     scaler = GradScaler() if args.use_amp and torch.cuda.is_available() else None
     writer = SummaryWriter(log_dir=args.log_dir)
@@ -121,10 +147,25 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     best_loss = float("inf")
-    patience = 3
+    patience = args.patience
     counter = 0
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.resume_from:
+        if Path(args.resume_from).exists():
+            logger.info(f"Resuming from checkpoint: {args.resume_from}")
+            checkpoint = torch.load(args.resume_from, map_location=device)
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            start_epoch = checkpoint["epoch"]
+            best_loss = checkpoint.get("best_loss", float("inf"))
+            logger.info(f"Resumed from epoch {start_epoch}, best_loss: {best_loss}")
+        else:
+            logger.error(f"Checkpoint file not found: {args.resume_from}")
+            return
+
+    for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(
             model,
             train_dataloader,
@@ -139,6 +180,14 @@ def main():
             device=device,
             use_amp=args.use_amp,
         )
+
+        # Check for gradient explosion
+        if math.isnan(train_loss) or math.isinf(train_loss):
+            logger.error(
+                f"Training stopped due to gradient explosion at epoch {epoch + 1}"
+            )
+            break
+
         valid_loss = valid_one_epoch(
             model,
             valid_dataloader,
@@ -150,7 +199,7 @@ def main():
         )
 
         writer.add_scalar("Epoch/Loss", train_loss, epoch)
-        writer.add_scalar("Epoch/LR", scheduler._get_lr(), epoch)
+        writer.add_scalar("Epoch/LR", scheduler.get_last_lr()[0], epoch)
         writer.add_scalar("Valid/Loss", valid_loss, epoch)
 
         if valid_loss < best_loss - 1e-4:
@@ -176,7 +225,7 @@ def main():
             )
 
         logger.info(
-            f"Epoch {epoch + 1}, train_loss: {train_loss:.4f}, valid_loss: {valid_loss:.4f}, lr: {scheduler._get_lr():.4f}"
+            f"Epoch {epoch + 1}, train_loss: {train_loss:.4f}, valid_loss: {valid_loss:.4f}, lr: {scheduler.get_last_lr()[0]:.4f}"
         )
 
 
