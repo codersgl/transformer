@@ -33,9 +33,12 @@ class ScaleDotProductAttention(nn.Module):
         )  # [batch_size, num_heads, seq_len_q, seq_len_k]
 
         if mask is not None:
-            score = score.masked_fill(mask == 0, -1e4)
+            # 使用 float('-inf') 对于 softmax 是最安全的，
+            # 无论是在 fp16 还是 fp32 下，softmax 都能正确处理 -inf (变为 0)
+            score = score.masked_fill(mask == 0, float("-inf"))
 
-        attention_weights = F.softmax(score, dim=-1)
+        # 为了数值稳定性，softmax 建议在 fp32 下进行
+        attention_weights = F.softmax(score, dim=-1, dtype=torch.float32).type_as(score)
 
         if self.dropout is not None:
             attention_weights = self.dropout(attention_weights)
