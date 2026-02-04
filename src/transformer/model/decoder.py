@@ -17,7 +17,9 @@ class DecoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
         self.norm3 = nn.LayerNorm(embed_dim)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -26,8 +28,8 @@ class DecoderBlock(nn.Module):
         src_mask=None,
         tgt_mask=None,
     ):
-        x = x + self.dropout(self.masked_multi_head_attn(self.norm1(x), mask=tgt_mask))
-        x = x + self.dropout(
+        x = x + self.dropout1(self.masked_multi_head_attn(self.norm1(x), mask=tgt_mask))
+        x = x + self.dropout2(
             self.multi_head_attn(
                 query=self.norm2(x),
                 key=encoder_output,
@@ -35,7 +37,7 @@ class DecoderBlock(nn.Module):
                 mask=src_mask,
             )
         )
-        x = x + self.dropout(self.feed_forward_net(self.norm3(x)))
+        x = x + self.dropout3(self.feed_forward_net(self.norm3(x)))
         return x
 
 
