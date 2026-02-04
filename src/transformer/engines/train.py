@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+import math
 from torch.amp.autocast_mode import autocast
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from loguru import logger
 
 
 def train_one_epoch(
@@ -22,6 +24,11 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    
+    # Clear CUDA cache at start of epoch
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch_idx, batch in enumerate(pbar):
@@ -46,32 +53,58 @@ def train_one_epoch(
             pred = model(src_ids, tgt_input, src_mask, tgt_mask)
             loss = loss_fn(pred.reshape(-1, vocab_size), tgt_label.reshape(-1))
 
+        # Check for inf/nan BEFORE backward to prevent gradient explosion
+        loss_item = loss.item()
+        if math.isnan(loss_item) or math.isinf(loss_item):
+            logger.error(f"Loss is NaN/Inf at epoch {epoch}, batch {batch_idx}! Value: {loss_item}")
+            return float("nan")
+
         optimizer.zero_grad()
 
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)  # 先 unscale 才能裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Check gradients for inf/nan after unscale
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
+                logger.error(f"Gradient is NaN/Inf at epoch {epoch}, batch {batch_idx}!")
+                return float("nan")
+            
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Check gradients for inf/nan after backward
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
+                logger.error(f"Gradient is NaN/Inf at epoch {epoch}, batch {batch_idx}!")
+                return float("nan")
+            
             optimizer.step()
 
         scheduler.step()
 
-        loss_item = loss.item()
         total_loss += loss_item
 
         global_step = epoch * len(dataloader) + batch_idx
         if batch_idx % 10 == 0:
             writer.add_scalar("Train/Loss", loss_item, global_step)
-            writer.add_scalar("Train/LR", scheduler._get_lr(), global_step)
+            writer.add_scalar("Train/LR", scheduler.get_last_lr()[0], global_step)
 
         pbar.set_postfix(
-            {"loss": f"{loss_item:.4f}", "lr": f"{scheduler._get_lr():.6f}"}
+            {"loss": f"{loss_item:.4f}", "lr": f"{scheduler.get_last_lr()[0]:.6f}"}
         )
+        
+        # Periodic aggressive memory cleanup
+        if batch_idx % 500 == 0 and device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Clear CUDA cache to prevent memory accumulation
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     return total_loss / len(dataloader)
 
